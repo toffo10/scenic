@@ -19,18 +19,20 @@ python evaluator.py \
   --output_dir=/tmp/evaluator
 
 """
-# GOOGLE INTERNAL pylint: disable=g-importing-member
+
 import collections
-import datetime
 import functools
 import json
 import multiprocessing
 import os
 import re
+import runpy
 import tempfile
+from prettytable import PrettyTable
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import urllib
 import zipfile
+import contextlib
 
 from absl import app
 from absl import flags
@@ -47,8 +49,8 @@ from matplotlib import pyplot as plt
 import ml_collections
 import numpy as np
 from pycocotools.coco import COCO
+from scipy.special import expit as sigmoid
 from pycocotools.cocoeval import COCOeval
-from scenic.projects.owl_vit import configs
 from scenic.projects.owl_vit import models
 from scenic.projects.owl_vit.preprocessing import image_ops
 from scenic.projects.owl_vit.preprocessing import label_ops
@@ -88,6 +90,8 @@ flags.DEFINE_string(
     required=True)
 flags.DEFINE_string(
     'output_dir', None, 'Directory to write predictions to.', required=True)
+flags.DEFINE_bool(
+    'overwrite', False, 'Whether to overwrite existing results.')
 flags.DEFINE_string(
     'tfds_name',
     'lvis',
@@ -119,21 +123,20 @@ flags.DEFINE_integer(
     'one-indexed labels, so label_shift should be 1 for these datasets. Set '
     'it to 0 for zero-indexed datasets.'
 )
+flags.DEFINE_float(
+    'confidence_threshold', 0.1,
+    'Threshold for setting a minimum confidence value'
+)
 
 FLAGS = flags.FLAGS
 
 _MIN_BOXES_TO_PLOT = 5
 _PRED_BOX_PLOT_FACTOR = 3
-_PLOTTING_SCORE_THRESHOLD = 0.01
 
 
 Variables = nn.module.VariableDict
 ModelInputs = Any
 Predictions = Any
-
-
-def _timestamp() -> str:
-  return datetime.datetime.now().strftime('%Y_%m_%d_%H_%M_%S_%f')
 
 
 def get_dataset(tfds_name: str,
@@ -155,17 +158,12 @@ def get_dataset(tfds_name: str,
     raise ValueError(f'Unknown data format: {data_format}.')
   pp_fn = preprocess_spec.PreprocessFn([
       decoder,
-      image_ops.ResizeWithPad(input_size, pad_value=0.0),
+      image_ops.ResizeWithPad(input_size, antialias=True),
       image_ops.Keep(
           [modalities.IMAGE, modalities.IMAGE_ID, modalities.ORIGINAL_SIZE])
   ], only_jax_types=True)
-  ds = (
-      ds.map(pp_fn, num_parallel_calls=tf.data.AUTOTUNE)
-      .batch(1)
-      .batch(jax.device_count())
-      .prefetch(tf.data.AUTOTUNE)
-  )
-  return ds, class_names
+  num_devices = jax.device_count()
+  return ds.map(pp_fn).batch(1).batch(num_devices), class_names
 
 
 def tokenize_queries(tokenize: Callable[[str, int], List[int]],
@@ -347,12 +345,12 @@ def format_predictions(*,
   """
   predictions = []
   num_batches, num_instances = scores.shape
+
   for batch in range(num_batches):
     h, w = image_sizes[batch]
     for instance in range(num_instances):
       label = int(labels[batch, instance])
-      if not label:
-        continue
+
       score = float(scores[batch, instance])
       # Internally, we use center coordinates, but COCO uses corner coordinates:
       bcx, bcy, bw, bh = unpad_box(boxes[batch, instance], image_w=w, image_h=h)
@@ -436,7 +434,7 @@ def get_predictions(config: ml_collections.ConfigDict,
 
     outputs = predict(batch[modalities.IMAGE], query_embeddings)  # pytype: disable=wrong-arg-types  # jax-ndarray
 
-    # Selec top k predictions:
+    # Select top k predictions:
     scores, labels, boxes = pmapped_top_k(
         outputs[modalities.SCORES],
         outputs[modalities.PREDICTED_BOXES],
@@ -450,16 +448,41 @@ def get_predictions(config: ml_collections.ConfigDict,
         batch[modalities.IMAGE_ID]
     ])
 
+    # Trova i valori che hanno scores che sono superiori alla soglia
+    top_k_predictions = zip(scores[0], labels[0], boxes[0])
+    top_k_predictions_filter=list(filter(lambda s: s[0] > FLAGS.confidence_threshold, top_k_predictions))
+    
+    filtered_scores = []
+    filtered_labels = []
+    filtered_boxes = []
+
+    # Se la lista non è vuota
+    if top_k_predictions_filter:
+      # Scompatta le tuple in tre liste separate
+      filtered_scores, filtered_labels, filtered_boxes = zip(*top_k_predictions_filter)
+
+    # print(f"Scores: {scores}")
+    # print(f"Labels: {labels}")
+    # print(f"Boxes: {boxes}")
+
+    # Converte le liste in array con una dimensione in più, richiesto per il codice
+    filtered_scores = np.array([list(filtered_scores)])
+    filtered_labels = np.array([list(filtered_labels)])
+    filtered_boxes = np.array([list(filtered_boxes)])
+
+    # print(f"filtered_scores: {filtered_scores}")
+    # print(f"filtered_labels: {filtered_labels}")
+    # print(f"filtered_boxes: {filtered_boxes}")
+
     # Append predictions:
     predictions.extend(
         format_predictions(
-            scores=scores,
-            labels=labels,
-            boxes=boxes,
+            scores=filtered_scores,
+            labels=filtered_labels,
+            boxes=filtered_boxes,
             image_sizes=image_sizes,
             image_ids=image_ids,
             label_shift=label_shift))
-
   return predictions
 
 
@@ -532,11 +555,74 @@ def run_evaluation(annotations_path: str,
     elif data_format == 'coco':
       coco_gt = COCO(annotations_path_local)
       coco_dt = coco_gt.loadRes(predictions_path)
-      coco_eval = COCOeval(coco_gt, coco_dt, iouType='bbox')
-      coco_eval.evaluate()
-      coco_eval.accumulate()
-      coco_eval.summarize()
-      return {k: v for k, v in zip(COCO_METRIC_NAMES, coco_eval.stats)}
+
+      # Ottieni gli ID delle categorie
+      cat_ids = coco_gt.getCatIds()
+      
+      cocoEval = COCOeval(coco_gt, coco_dt, 'bbox')
+
+      # Inizializza la tabella
+      table = PrettyTable()
+      table.field_names = ["class", "gts", "dets", "recall", "ap"]
+      table.align["class"] = "l"
+      table.align["gts"] = "l"
+      table.align["dets"] = "l"
+      table.align["recall"] = "l"
+      table.align["ap"] = "l"
+
+      mAP = 0
+      # Lista per memorizzare le righe come dizionari
+      rows = []
+
+      # Esegui la valutazione per ogni categoria
+      for index, cat_id in enumerate(cat_ids):
+        
+          cat_name = coco_gt.loadCats(cat_id)[0]['name']
+
+          # Per il ground truth
+          gt_ann_ids = coco_gt.getAnnIds(catIds=[cat_id])
+          gt_anns = coco_gt.loadAnns(gt_ann_ids)
+          gt_count = len(gt_anns)
+
+          # Per le predizioni
+          dt_ann_ids = coco_dt.getAnnIds(catIds=[cat_id])
+          dt_anns = coco_dt.loadAnns(dt_ann_ids)
+          dt_count = len(dt_anns)
+
+          cocoEval.params.catIds = [cat_id]  # Imposta la categoria desiderata
+          cocoEval.params.iouThrs = [0.5]  # Imposta la categoria desiderata
+          cocoEval.params.maxDets = [100, 100, 100]  # Imposta la categoria desiderata
+ 
+          with contextlib.redirect_stdout(None):
+            cocoEval.evaluate()
+            cocoEval.accumulate()
+            cocoEval.summarize()
+
+          cat_name = coco_gt.loadCats(cat_id)[0]['name']
+          ap = cocoEval.stats[0] if cocoEval.stats[0] > 0 else 0
+          recall = cocoEval.stats[8] if cocoEval.stats[8] > 0 else 0
+
+          mAP += ap
+
+          rows.append({"class": cat_name, "gts": gt_count, "dets": dt_count, "ap": ap, "recall": recall})
+
+          # print(f"Risultati per la categoria {coco_gt.loadCats(cat_id)[0]['name']}:")
+          # print(f"mAP: {cocoEval.stats[0]}")
+          # print(f"AR: {cocoEval.stats[8]}")
+          # print(f"Numero di bounding box nel ground truth: {gt_count}")
+          # print(f"Numero di bounding box rilevate: {dt_count}")
+
+      # Ordino per ap
+      # Ordina la lista di dizionari in base al campo 'mAP' in ordine decrescente
+      sorted_rows = sorted(rows, key=lambda x: x['class'])
+
+      for index, row in enumerate(sorted_rows):
+        table.add_row([row["class"], row["gts"], row["dets"], row["recall"], row["ap"]], divider=index == len(sorted_rows) - 1)
+
+      table.add_row(["mAP", "", "", "", mAP / len(cat_ids)])
+      print(table)
+
+      return {k: v for k, v in zip(COCO_METRIC_NAMES, cocoEval.stats)}
     else:
       raise ValueError(f'Unknown data format: {data_format}')
 
@@ -598,12 +684,10 @@ def plot_image(pixels, image_id, gt_by_image, pred_by_image, labels):
   if anns:
     n = _MIN_BOXES_TO_PLOT + len(gt_by_image[image_id]) *  _PRED_BOX_PLOT_FACTOR
     n = min(n, len(anns))
-    threshold = np.partition(np.array([a['score'] for a in anns]), -n)[-n]
-    threshold = max(threshold, _PLOTTING_SCORE_THRESHOLD)
     for ann in gt_by_image[image_id]:
       plot_box(ax, ann, color='g', label=False)
     for ann in anns:
-      if ann['score'] <= threshold:
+      if ann['score'] <= FLAGS.confidence_threshold:
         continue
       plot_box(ax, ann, color='r', labels=labels, score=ann['score'])
   ax.set_title('Predictions')
@@ -657,7 +741,6 @@ def save_examples_images(*, ground_truth_path, pred_path, tfds_name, split,
 def main(argv: Sequence[str]) -> None:
   if len(argv) > 1:
     raise app.UsageError('Too many command-line arguments.')
-  logging.info('Starting evaluation.')
 
   # Make CPU cores visible as JAX devices:
   jax.config.update('jax_platform_name', FLAGS.platform)
@@ -675,6 +758,17 @@ def main(argv: Sequence[str]) -> None:
   compilation_cache.initialize_cache('/tmp/jax_compilation_cache')
 
   config_name = os.path.splitext(os.path.basename(FLAGS.config))[0]
+  output_dir = os.path.join(FLAGS.output_dir, config_name, FLAGS.tfds_name)
+  tf.io.gfile.makedirs(output_dir)
+  existing = tf.io.gfile.glob(os.path.join(output_dir, f'*_{FLAGS.split}.json'))
+  if existing:
+    if FLAGS.overwrite:
+      for path in existing:
+        tf.io.gfile.remove(path)
+    else:
+      print(
+          f'Found existing results and --overwrite=false, exiting: {existing}')
+      return
 
   if tf.io.gfile.exists(FLAGS.annotations_path):
     annotations_path = FLAGS.annotations_path
@@ -682,17 +776,13 @@ def main(argv: Sequence[str]) -> None:
     annotations_path = _download_annotations(FLAGS.annotations_path)
 
   predictions = get_predictions(
-      config=getattr(configs, FLAGS.config).get_config(),
+      config=runpy.run_path(FLAGS.config)['get_config'](),
       checkpoint_path=FLAGS.checkpoint_path,
       tfds_name=FLAGS.tfds_name,
       split=FLAGS.split,
       label_shift=FLAGS.label_shift)
 
-  output_dir = os.path.join(
-      FLAGS.output_dir, config_name, FLAGS.tfds_name, _timestamp()
-  )
-  logging.info('Writing predictions to %s', output_dir)
-  tf.io.gfile.makedirs(output_dir)
+  logging.info('Writing predictions...')
   predictions_path = write_predictions(predictions, output_dir, FLAGS.split)
 
   logging.info('Running evaluation...')

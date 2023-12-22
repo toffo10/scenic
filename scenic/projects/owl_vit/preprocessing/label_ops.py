@@ -31,11 +31,13 @@ PADDING_QUERY = ''
 CLIP_BEST_PROMPT_TEMPLATES = [
     'itap of a {}.',
     'a bad photo of the {}.',
-    'a origami {}.',
+    'a photo from above of {}.',
     'a photo of the large {}.',
     'a {} in a video game.',
     'art of the {}.',
     'a photo of the small {}.',
+    'an aerial photo of the {}.',
+    'a black and white aerial photo of the {}.',
 ]
 
 # From
