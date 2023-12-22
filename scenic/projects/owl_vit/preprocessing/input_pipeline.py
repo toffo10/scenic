@@ -53,8 +53,8 @@ DECODERS = {
         label_ops.DecodeVisualGenome,
     'lvis:1.2.0':
         label_ops.DecodeLvis,
-    'objects365:0.0.1':
-        label_ops.DecodeObjects365,
+    'custom_tfds:1.0.0':
+        label_ops.DecodeCustom, # Modifica
 }
 
 # All ops must be listed in either PRE_MOSAIC_OPS or POST_MOSAIC_OPS or both.

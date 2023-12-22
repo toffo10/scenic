@@ -486,6 +486,32 @@ class DecodeObjects365(image_ops.DecodeCocoExample):
         tfds_name='objects365', is_promptable=self.is_promptable)(features)
 
 
+@dataclasses.dataclass(frozen=True)
+class DecodeCustom(image_ops.DecodeCocoExample):
+  """Given an Object365 TFDS example, create features with boxes."""
+  is_promptable: bool = True
+  tfds_data_dir: Optional[str] = None
+
+  def get_class_name(self, label_idx: tf.Tensor) -> tf.Tensor:
+    """Reads and constructs a mapping from integer classes to text labels."""
+    # First label is "padding" and needs to be removed:
+    class_labels = list(get_label_map('objects365').values())[1:]
+    classes = tf.convert_to_tensor(class_labels)
+    return tf.gather(classes, label_idx)
+
+  def __call__(self, features: Features) -> Features:
+    features = features.copy()
+    # Add missing field.
+    features['objects']['id'] = tf.zeros_like(features['objects']['label'])
+    features = super().__call__(features)
+
+    # Dummy negative labels:
+    features[modalities.NEGATIVE_LABELS] = tf.fill([1], -1)
+
+    return IntegerToTextLabels(
+        tfds_name='custom_tfds', is_promptable=self.is_promptable)(features)
+
+
 @dataclasses.dataclass
 class CanonicalizeTextLabels(NamedPreprocessOp):
   """Removes non-alphanum chars (except promptability marker) from labels."""
