@@ -28,9 +28,11 @@ def _fix_old_layernorm(transformer_params):
     return transformer_params
 
   fixed_params = copy.deepcopy(transformer_params)
-  for resblock in fixed_params.values():
-    resblock['ln_0'] = resblock.pop('ln_1')
-    resblock['ln_1'] = resblock.pop('ln_2')
+
+  if 'ln_2' in fixed_params.values():
+    for resblock in fixed_params.values():
+      resblock['ln_0'] = resblock.pop('ln_1')
+      resblock['ln_1'] = resblock.pop('ln_2')
 
   return fixed_params
 
