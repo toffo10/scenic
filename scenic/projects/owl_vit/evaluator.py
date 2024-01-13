@@ -463,24 +463,14 @@ def get_predictions(config: ml_collections.ConfigDict,
 
     # Trova i valori che hanno scores che sono superiori alla soglia
     top_k_predictions = zip(scores, labels, boxes)
-    top_k_predictions_filter=list(filter(lambda s: s[0] > FLAGS.confidence_threshold, top_k_predictions))
-    
-    filtered_scores = []
-    filtered_labels = []
-    filtered_boxes = []
-
-    # Se la lista non è vuota
-    if top_k_predictions_filter:
-      # Scompatta le tuple in tre liste separate
-      filtered_scores, filtered_labels, filtered_boxes = zip(*top_k_predictions_filter)
-
+  
     # Effettuo NMS
-    nms_boxes, nms_labels, nms_scores = nms(filtered_boxes, filtered_labels, filtered_scores, FLAGS.nms_threshold)
+    nms_boxes, nms_labels, nms_scores = nms(boxes, labels, scores, FLAGS.nms_threshold)
 
     # Converte le liste in array con una dimensione in più, richiesto per il codice
-    nms_scores = np.array([list(filtered_scores)])
-    nms_labels = np.array([list(filtered_labels)])
-    nms_boxes = np.array([list(filtered_boxes)])
+    nms_scores = np.array([list(nms_scores)])
+    nms_labels = np.array([list(nms_labels)])
+    nms_boxes = np.array([list(nms_boxes)])
     
     # Append predictions:
     predictions.extend(
@@ -632,6 +622,29 @@ def _download_annotations(annotations_path: str) -> str:
 
   return annotations_path
 
+def calculate_ap(precision_scores, recall_scores):
+    # Numero di intervalli di recall (0, 0.1, 0.2, ..., 1)
+    recall_levels = np.arange(0, 1.1, 0.1)
+
+    # Numero di classi
+    num_classes = precision_scores.shape[1]
+
+    # Inizializza un array per immagazzinare l'AP per ogni classe e ogni livello di recall
+    ap_scores = np.zeros((len(recall_levels), num_classes))
+
+    for i, recall_level in enumerate(recall_levels):
+        for class_idx in range(num_classes):
+            # Trova gli indici dove il livello di recall è maggiore o uguale a recall_level
+            valid_recall_indices = np.where(recall_scores[:, class_idx] >= recall_level)[0]
+
+            # Calcola la precisione massima per i livelli di recall validi
+            max_precision = np.max(precision_scores[valid_recall_indices, class_idx]) if valid_recall_indices.size > 0 else 0
+
+            # Memorizza il valore AP per questa classe e livello di recall
+            ap_scores[i, class_idx] = max_precision
+
+    return ap_scores
+
 def run_evaluation(annotations_path: str,
                    predictions_path: str,
                    data_format: str = 'lvis') -> Dict[str, float]:
@@ -642,44 +655,68 @@ def run_evaluation(annotations_path: str,
     with open(predictions_path) as file:
         coco_dt = json.load(file)
 
-    for ann_gt in coco_gt['annotations']:
-        for ann_dt in coco_dt:
-            # Se annotazione o ground truth già matchata, skippo
-            if 'matched' in ann_dt or 'matched' in ann_gt:
-                continue
+    # Define probability thresholds to use, between 0 and 1
+    confidence_thresholds = np.linspace(0, 1, num=100)
+    precision_scores = np.empty([len(confidence_thresholds), len(coco_gt.cats)])
+    recall_scores = np.empty([len(confidence_thresholds), len(coco_gt.cats)])
 
-            if (ann_gt['category_id'] != ann_dt['category_id'] or
-                    ann_gt['image_id'] != ann_dt['image_id']):
-                continue
+    for c in confidence_thresholds:
+      for ann_gt in coco_gt['annotations']:
+          for ann_dt in coco_dt:
+              # Se annotazione con confidenza minore di quella desiderata, skippo
+              if ann_dt['score'] < c:
+                  continue
 
-            iou = calculate_iou(ann_gt['bbox'], ann_dt['bbox'])
+              # Se annotazione o ground truth già matchata, skippo
+              if 'matched' in ann_dt or 'matched' in ann_gt:
+                  continue
 
-            if iou >= FLAGS.iou_threshold:
-                ann_gt['matched'] = True
-                ann_dt['matched'] = True
+              if (ann_gt['category_id'] != ann_dt['category_id'] or
+                      ann_gt['image_id'] != ann_dt['image_id']):
+                  continue
 
-    coco_gt = COCO(annotations_path)
+              iou = calculate_iou(ann_gt['bbox'], ann_dt['bbox'])
 
-    # Calcolo i valori separati per categoria
-    true_positive = [0] * len(coco_gt.cats)
-    total_predictions = [0] * len(coco_gt.cats)
-    total_ground_truth = [0] * len(coco_gt.cats)
+              if iou >= FLAGS.iou_threshold:
+                  ann_gt['matched'] = True
+                  ann_dt['matched'] = True
 
-    for ann_dt in coco_dt:
-        total_predictions[ann_dt['category_id']] += 1
-        if 'matched' in ann_dt:
-            true_positive[ann_dt['category_id']] += 1
+      coco_gt = COCO(annotations_path)
 
-    for index, cat_id in enumerate(coco_gt.getCatIds()):
-        gt_ann_ids = coco_gt.getAnnIds(catIds=[cat_id])
-        gt_anns = coco_gt.loadAnns(gt_ann_ids)
-        gt_count = len(gt_anns)
+      # Calcolo i valori separati per categoria
+      true_positive = [0] * len(coco_gt.cats)
+      total_predictions = [0] * len(coco_gt.cats)
+      total_ground_truth = [0] * len(coco_gt.cats)
 
-        total_ground_truth[index] = gt_count
+      for ann_dt in coco_dt:
+          total_predictions[ann_dt['category_id']] += 1
+          if 'matched' in ann_dt:
+              true_positive[ann_dt['category_id']] += 1
 
-    print_table(coco_gt, total_ground_truth, total_predictions, true_positive)
+      for index, cat_id in enumerate(coco_gt.getCatIds()):
+          gt_ann_ids = coco_gt.getAnnIds(catIds=[cat_id])
+          gt_anns = coco_gt.loadAnns(gt_ann_ids)
+          gt_count = len(gt_anns)
 
-def print_table(coco_gt, total_ground_truth, total_predictions, true_positive):
+          total_ground_truth[index] = gt_count
+
+      for index, cat_id in enumerate(coco_gt.getCatIds()):
+          if total_ground_truth[index] == 0:
+            recall_scores[c][index] += round(0, 2)
+          else:
+            recall_scores[c][index] += round(true_positive[index] / total_ground_truth[index], 2)
+
+          if total_predictions[index] == 0:
+            precision_scores[c][index] += round(0, 2)
+          else:
+            precision_scores[c][index] += round(true_positive[index] / total_predictions[index], 2)
+
+    # Calcolo degli AP scores
+    ap_scores = calculate_ap(precision_scores, recall_scores)
+
+    print_table(coco_gt, total_ground_truth, total_predictions, true_positive, ap_scores)
+
+def print_table(coco_gt, total_ground_truth, total_predictions, true_positive, ap_scores):
     # Inizializza la tabella
     table = PrettyTable()
     table.field_names = ["class", "gts", "dets", "recall", "ap"]
@@ -692,20 +729,8 @@ def print_table(coco_gt, total_ground_truth, total_predictions, true_positive):
     # Ottieni gli ID delle categorie
     cat_ids = coco_gt.getCatIds()
 
-    mAP = 0
     for index in range(len(cat_ids)):
-        if total_ground_truth[index] == 0:
-            recall = round(0, 2)
-        else:
-            recall = round(true_positive[index] / total_ground_truth[index], 2)
-
-        if total_predictions[index] == 0:
-            ap = round(0, 2)
-        else:
-            ap = round(true_positive[index] / total_predictions[index], 2)
-
-        mAP += ap
-        table.add_row([coco_gt.cats[index]['name'], total_ground_truth[index], total_predictions[index], recall, ap],
+        table.add_row([coco_gt.cats[index]['name'], total_ground_truth[index], total_predictions[index], ap_scores],
                       divider=index == len(cat_ids) - 1)
 
     mAP = round(mAP / len(coco_gt.cats), 2)
