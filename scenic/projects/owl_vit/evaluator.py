@@ -34,6 +34,8 @@ import urllib
 import zipfile
 import contextlib
 
+import skimage
+from skimage import io as skimage_io
 from absl import app
 from absl import flags
 from absl import logging
@@ -46,6 +48,8 @@ from lvis.eval import LVISEval
 from lvis.lvis import LVIS
 from lvis.results import LVISResults
 from matplotlib import pyplot as plt
+from PIL import Image
+from scenic.projects.owl_vit.notebooks import inference
 import ml_collections
 import numpy as np
 from pycocotools.coco import COCO
@@ -126,6 +130,18 @@ flags.DEFINE_integer(
 flags.DEFINE_float(
     'confidence_threshold', 0.1,
     'Threshold for setting a minimum confidence value'
+)
+flags.DEFINE_float(
+    'iou_threshold', 0.4,
+    'Threshold for setting the iou threshold value for counting a match between gts and dets'
+)
+flags.DEFINE_float(
+    'nms_threshold', 0.4,
+    'Threshold for setting nms threshold'
+)
+flags.DEFINE_string(
+    'input_directory', None,
+    'Directory where the images and annotation file are placed'
 )
 
 FLAGS = flags.FLAGS
@@ -224,37 +240,39 @@ def get_predict_fn(
 
   Returns:
     Jitted predict function.
-  """
+  """  
+  image_embedder = jax.jit(
+      functools.partial(
+          module.apply, variables, train=False, method=module.image_embedder
+      )
+  )
+
+  box_predictor = jax.jit(
+      functools.partial(module.apply, variables, method=module.box_predictor)
+  )
+
+  class_predictor = jax.jit(
+      functools.partial(module.apply, variables, method=module.class_predictor)
+  )
 
   def apply(method, **kwargs):
     return module.apply(variables, **kwargs, method=method)
-
-  @functools.partial(jax.pmap, in_axes=(0, None))
+    
   def predict(images, query_embeddings):
-
     # Embed images:
-    feature_map = apply(module.image_embedder, images=images, train=False)
+    feature_map = image_embedder(images[None,...])
     b, h, w, d = feature_map.shape
-    image_features = jnp.reshape(feature_map, (b, h * w, d))
 
-    # Class predictions are ensembled over query embeddings:
-    class_predictor = functools.partial(
-        apply, module.class_predictor, image_features=image_features)
-    query_embeddings_ensemble = jnp.stack(query_embeddings, axis=0)
-    outputs_ensemble = jax.vmap(class_predictor)(
-        query_embeddings=query_embeddings_ensemble[:, jnp.newaxis, ...])
-    outputs = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0),
-                                     outputs_ensemble)
+    target_boxes = box_predictor(
+        image_features=feature_map.reshape(b, h * w, d), feature_map=feature_map
+    )['pred_boxes']
 
-    # Add box predictions:
-    outputs.update(
-        apply(
-            module.box_predictor,
-            image_features=image_features,
-            feature_map=feature_map))
+    out = class_predictor(
+        image_features=feature_map.reshape(b, h * w, d),
+        query_embeddings=query_embeddings[None, None, ...],  # [batch, queries, d]
+    )
 
-    outputs[modalities.SCORES] = jax.nn.sigmoid(outputs[modalities.LOGITS])
-    return outputs
+    return target_boxes, out
 
   return predict
 
@@ -400,12 +418,12 @@ def get_predictions(config: ml_collections.ConfigDict,
       body_configs=config.model.body,
       normalize=config.model.normalize,
       box_bias=config.model.box_bias)
-  module.tokenize('')  # Warm up the tokenizer.
-  variables = module.load_variables(checkpoint_path=checkpoint_path)
-  embed_queries = get_embed_queries_fn(module, variables)
-  predict = get_predict_fn(module, variables)
-  pmapped_top_k = jax.pmap(get_top_k, static_broadcasted_argnums=(2, 3))
 
+  config.init_from.checkpoint_path = checkpoint_path
+  variables = module.load_variables(checkpoint_path=checkpoint_path)
+  model = inference.Model(config, module, variables)
+  predict = get_predict_fn(module, variables)
+    
   # Create dataset:
   dataset, class_names = get_dataset(
       tfds_name=tfds_name,
@@ -415,15 +433,17 @@ def get_predictions(config: ml_collections.ConfigDict,
       tfds_download_dir=FLAGS.tfds_download_dir,
       data_format=FLAGS.data_format)
 
-  # Embed queries:
-  query_embeddings = []
-  for template in label_ops.CLIP_BEST_PROMPT_TEMPLATES:
-    tokenized_queries = tokenize_queries(
-        module.tokenize,
-        class_names,
-        template,
-        max_token_len=config.dataset_configs.max_query_length)
-    query_embeddings.append(embed_queries(np.array(tokenized_queries)))  # pytype: disable=wrong-arg-types  # jax-ndarray
+  input_images = load_input_json(FLAGS.input_directory + "/input_images.json")
+
+  tokenized_queries = np.empty((0, 512))
+
+  for input_image in input_images:
+    path = "/content/input_images/images/" + input_image['path']
+    image = Image.open(path)
+    input_array = np.array(image)
+    box = np.array(input_image['bbox'])
+    tokenized_query, _ = model.embed_image_query(input_array, box)
+    tokenized_queries = np.vstack([tokenized_queries, tokenized_query])
 
   # Prediction loop:
   predictions = []
@@ -432,24 +452,18 @@ def get_predictions(config: ml_collections.ConfigDict,
       desc='Inference progress',
       total=int(dataset.cardinality().numpy())):
 
-    outputs = predict(batch[modalities.IMAGE], query_embeddings)  # pytype: disable=wrong-arg-types  # jax-ndarray
+    # Load input image:
+    image = prepare_image(config, batch[modalities.IMAGE])
 
-    # Select top k predictions:
-    scores, labels, boxes = pmapped_top_k(
-        outputs[modalities.SCORES],
-        outputs[modalities.PREDICTED_BOXES],
-        top_k,
-        exclusive_classes,
-    )
+    target_boxes, out = predict(image, np.squeeze(tokenized_queries)) 
 
-    # Move to CPU:
-    scores, labels, boxes, image_sizes, image_ids = _unshard_and_get([
-        scores, labels, boxes, batch[modalities.ORIGINAL_SIZE],
-        batch[modalities.IMAGE_ID]
-    ])
+    logits = np.array(out['pred_logits'])[0, :, :]  # Remove padding.
+    scores = sigmoid(np.max(logits, axis=-1))[0]
+    labels = np.argmax(out['pred_logits'], axis=-1)[0][0]
+    boxes = target_boxes[2]
 
     # Trova i valori che hanno scores che sono superiori alla soglia
-    top_k_predictions = zip(scores[0], labels[0], boxes[0])
+    top_k_predictions = zip(scores, labels, boxes)
     top_k_predictions_filter=list(filter(lambda s: s[0] > FLAGS.confidence_threshold, top_k_predictions))
     
     filtered_scores = []
@@ -461,30 +475,118 @@ def get_predictions(config: ml_collections.ConfigDict,
       # Scompatta le tuple in tre liste separate
       filtered_scores, filtered_labels, filtered_boxes = zip(*top_k_predictions_filter)
 
-    # print(f"Scores: {scores}")
-    # print(f"Labels: {labels}")
-    # print(f"Boxes: {boxes}")
+    # Effettuo NMS
+    nms_boxes, nms_labels, nms_scores = nms(filtered_boxes, filtered_labels, filtered_scores, FLAGS.nms_threshold)
 
     # Converte le liste in array con una dimensione in più, richiesto per il codice
-    filtered_scores = np.array([list(filtered_scores)])
-    filtered_labels = np.array([list(filtered_labels)])
-    filtered_boxes = np.array([list(filtered_boxes)])
-
-    # print(f"filtered_scores: {filtered_scores}")
-    # print(f"filtered_labels: {filtered_labels}")
-    # print(f"filtered_boxes: {filtered_boxes}")
-
+    nms_scores = np.array([list(filtered_scores)])
+    nms_labels = np.array([list(filtered_labels)])
+    nms_boxes = np.array([list(filtered_boxes)])
+    
     # Append predictions:
     predictions.extend(
         format_predictions(
-            scores=filtered_scores,
-            labels=filtered_labels,
-            boxes=filtered_boxes,
-            image_sizes=image_sizes,
-            image_ids=image_ids,
+            scores=nms_scores,
+            labels=nms_labels,
+            boxes=nms_boxes,
+            image_sizes=batch[modalities.ORIGINAL_SIZE][0],
+            image_ids=batch[modalities.IMAGE_ID],
             label_shift=label_shift))
   return predictions
 
+def prepare_image(config, image):
+  # Pad to square with gray pixels on bottom and right:
+  image = np.squeeze(image)
+  h, w, _ = image.shape
+  size = max(h, w)
+  image_padded = np.pad(
+      image, ((0, size - h), (0, size - w), (0, 0)), constant_values=0.5
+  )
+
+  # Resize to model input size:
+  return skimage.transform.resize(
+      image_padded,
+      (config.dataset_configs.input_size, config.dataset_configs.input_size),
+      anti_aliasing=True,
+  )
+
+def iou(box1, box2):
+    cx1, cy1, w1, h1 = box1
+    cx2, cy2, w2, h2 = box2
+
+    x1, y1, x2, y2 = cx1 - w1/2, cy1 - h1/2, cx1 + w1/2, cy1 + h1/2
+    x1_, y1_, x2_, y2_ = cx2 - w2/2, cy2 - h2/2, cx2 + w2/2, cy2 + h2/2
+
+    inter_x1 = max(x1, x1_)
+    inter_y1 = max(y1, y1_)
+    inter_x2 = min(x2, x2_)
+    inter_y2 = min(y2, y2_)
+
+    inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+    area1 = (x2 - x1) * (y2 - y1)
+    area2 = (x2_ - x1_) * (y2_ - y1_)
+
+    iou = inter_area / float(area1 + area2 - inter_area)
+    return iou
+
+def nms(boxes, labels, scores, iou_threshold=0.5):
+    boxes = np.squeeze(boxes)
+    labels = np.squeeze(labels)
+    scores = np.squeeze(scores)
+
+    if len(boxes) == 0:
+        return [], [], []
+
+    pick = []
+
+    if boxes.ndim == 1:
+        boxes = boxes.reshape(1, -1)
+        scores = np.array([scores])
+        labels = np.array([labels])
+
+    x1 = boxes[:, 0] - boxes[:, 2]/2
+    y1 = boxes[:, 1] - boxes[:, 3]/2
+    x2 = boxes[:, 0] + boxes[:, 2]/2
+    y2 = boxes[:, 1] + boxes[:, 3]/2
+   
+    area = (x2 - x1) * (y2 - y1)
+    idxs = np.argsort(scores)
+
+    while len(idxs) > 0:
+        last = len(idxs) - 1
+        i = idxs[last]
+        pick.append(i)
+
+        suppress = [last]
+
+        for pos in range(last):
+            j = idxs[pos]
+            if labels[i] == labels[j]:
+                iou_val = iou(boxes[i], boxes[j])
+                if iou_val > iou_threshold:
+                    suppress.append(pos)
+
+        idxs = np.delete(idxs, suppress)
+
+    return boxes[pick], labels[pick], scores[pick]
+
+def load_input_json(json_file_path):
+    try:
+        with open(json_file_path, 'r') as f:
+            json_data = json.load(f)
+            annotations = json_data.get("annotations", [])
+            object_list = []
+            for obj in annotations:
+                object_list.append({
+                    'id': obj.get('id', None),
+                    'name': obj.get('name', None),
+                    'path': obj.get('path', None),
+                    'bbox': obj.get('bbox', None)
+                })
+        return object_list
+    except Exception as e:
+        print(f"Errore nel leggere il file JSON: {e}")
+        return None
 
 def _unshard_and_get(tree):
   tree_cpu = jax.device_get(tree)
@@ -531,17 +633,15 @@ def _download_annotations(annotations_path: str) -> str:
 
   return annotations_path
 
-
 def run_evaluation(annotations_path: str,
                    predictions_path: str,
                    data_format: str = 'lvis') -> Dict[str, float]:
-  """Runs evaluation and prints metric results."""
+    """Runs evaluation and prints metric results."""
+    with open(annotations_path, 'r') as file:
+        coco_gt = json.load(file)
 
-  # Copy annotations file in case it's not local:
-  with tempfile.TemporaryDirectory() as temp_dir:
-    annotations_path_local = os.path.join(
-        temp_dir, os.path.basename(annotations_path))
-    tf.io.gfile.copy(annotations_path, annotations_path_local)
+    with open(predictions_path) as file:
+        coco_dt = json.load(file)
 
     if data_format == 'lvis':
       lvis_gt = LVIS(annotations_path_local)
@@ -786,24 +886,17 @@ def main(argv: Sequence[str]) -> None:
   predictions_path = write_predictions(predictions, output_dir, FLAGS.split)
 
   logging.info('Running evaluation...')
-  try:
-    results = run_evaluation(annotations_path, predictions_path,
+  
+  run_evaluation(annotations_path, predictions_path, # Qui se voglio provare meglio pycocotools
                              FLAGS.data_format)
-  except IndexError as e:
-    logging.exception('IndexError while computing metric.')
-    results = {'ERROR': str(e)}
-
-  with tf.io.gfile.GFile(
-      os.path.join(output_dir, f'results_{FLAGS.split}.json'), 'w') as f:
-    json.dump(results, f, indent=4)
-
+  
   if FLAGS.num_example_images_to_save:
     logging.info('Saving example images...')
     examples_dir = os.path.join(output_dir, 'examples')
     tf.io.gfile.makedirs(examples_dir)
     save_examples_images(
         ground_truth_path=annotations_path,
-        pred_path=predictions_path,
+        pred_path=predictions_path, # Qui se voglio provare meglio pycocotools, modifico il percorso con un file mio
         tfds_name=FLAGS.tfds_name,
         split=FLAGS.split,
         output_dir=examples_dir,
