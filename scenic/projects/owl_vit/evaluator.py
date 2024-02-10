@@ -128,14 +128,6 @@ flags.DEFINE_integer(
     'it to 0 for zero-indexed datasets.'
 )
 flags.DEFINE_float(
-    'confidence_threshold', 0.1,
-    'Threshold for setting a minimum confidence value'
-)
-flags.DEFINE_float(
-    'iou_threshold', 0.4,
-    'Threshold for setting the iou threshold value for counting a match between gts and dets'
-)
-flags.DEFINE_float(
     'nms_threshold', 0.4,
     'Threshold for setting nms threshold'
 )
@@ -901,10 +893,9 @@ def main(argv: Sequence[str]) -> None:
   logging.info('Writing predictions...')
   predictions_path = write_predictions(predictions, output_dir, FLAGS.split)
 
-  logging.info('Running evaluation...')
-  
-  run_evaluation(annotations_path, predictions_path, # Qui se voglio provare meglio pycocotools
-                             FLAGS.data_format)
+  #logging.info('Running evaluation...')
+  #run_evaluation(annotations_path, predictions_path, # Qui se voglio provare meglio pycocotools
+  #                           FLAGS.data_format)
   
   if FLAGS.num_example_images_to_save:
     logging.info('Saving example images...')
