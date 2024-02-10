@@ -763,17 +763,17 @@ def main(argv: Sequence[str]) -> None:
   tf.io.gfile.makedirs(output_dir)
   predictions_path = write_predictions(predictions, output_dir, FLAGS.split)
 
-  logging.info('Running evaluation...')
-  try:
-    results = run_evaluation(annotations_path, predictions_path,
-                             FLAGS.data_format)
-  except IndexError as e:
-    logging.exception('IndexError while computing metric.')
-    results = {'ERROR': str(e)}
+  #logging.info('Running evaluation...')
+  #try:
+  #  results = run_evaluation(annotations_path, predictions_path,
+  #                           FLAGS.data_format)
+  #except IndexError as e:
+  #  logging.exception('IndexError while computing metric.')
+  #  results = {'ERROR': str(e)}
 
-  with tf.io.gfile.GFile(
-      os.path.join(output_dir, f'results_{FLAGS.split}.json'), 'w') as f:
-    json.dump(results, f, indent=4)
+  #with tf.io.gfile.GFile(
+  #    os.path.join(output_dir, f'results_{FLAGS.split}.json'), 'w') as f:
+  #  json.dump(results, f, indent=4)
 
   if FLAGS.num_example_images_to_save:
     logging.info('Saving example images...')
