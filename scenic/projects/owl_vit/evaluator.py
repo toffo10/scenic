@@ -463,24 +463,28 @@ def get_predictions(config: ml_collections.ConfigDict,
 
     # Trova i valori che hanno scores che sono superiori alla soglia
     top_k_predictions = zip(scores, labels, boxes)
-    top_k_predictions_filter=list(filter(lambda s: s[0] > FLAGS.confidence_threshold, top_k_predictions))
     
-    filtered_scores = []
-    filtered_labels = []
-    filtered_boxes = []
+    # Ordina le predizioni per score in ordine decrescente
+    top_k_predictions_sorted = sorted(top_k_predictions, key=lambda s: s[0], reverse=True)
+    # Seleziona le prime 300 predizioni
+    top_k_predictions_sorted = top_k_predictions_sorted[:top_k]
+    
+    sorted_scores = []
+    sorted_labels = []
+    sorted_boxes = []
 
     # Se la lista non è vuota
-    if top_k_predictions_filter:
+    if top_k_predictions_sorted:
       # Scompatta le tuple in tre liste separate
-      filtered_scores, filtered_labels, filtered_boxes = zip(*top_k_predictions_filter)
+      sorted_scores, sorted_labels, sorted_boxes = zip(*top_k_predictions_sorted)
 
     # Effettuo NMS
-    nms_boxes, nms_labels, nms_scores = nms(filtered_boxes, filtered_labels, filtered_scores, FLAGS.nms_threshold)
+    nms_boxes, nms_labels, nms_scores = nms(sorted_boxes, sorted_labels, sorted_scores, FLAGS.nms_threshold)
 
     # Converte le liste in array con una dimensione in più, richiesto per il codice
-    nms_scores = np.array([list(filtered_scores)])
-    nms_labels = np.array([list(filtered_labels)])
-    nms_boxes = np.array([list(filtered_boxes)])
+    nms_scores = np.array([list(sorted_scores)])
+    nms_labels = np.array([list(sorted_labels)])
+    nms_boxes = np.array([list(sorted_boxes)])
     
     # Append predictions:
     predictions.extend(
