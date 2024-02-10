@@ -351,8 +351,7 @@ def format_predictions(*,
     h, w = image_sizes[batch]
     for instance in range(num_instances):
       label = int(labels[batch, instance])
-      if not label:
-        continue
+      
       score = float(scores[batch, instance])
       # Internally, we use center coordinates, but COCO uses corner coordinates:
       bcx, bcy, bw, bh = unpad_box(boxes[batch, instance], image_w=w, image_h=h)
