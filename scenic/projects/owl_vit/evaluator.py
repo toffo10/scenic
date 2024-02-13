@@ -135,6 +135,10 @@ flags.DEFINE_string(
     'input_directory', None,
     'Directory where the images and annotation file are placed'
 )
+flags.DEFINE_float(
+    'confidence_threshold', 0.1,
+    'Threshold for setting a minimum confidence value'
+)
 
 FLAGS = flags.FLAGS
 
