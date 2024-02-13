@@ -88,6 +88,8 @@ flags.DEFINE_string(
     required=True)
 flags.DEFINE_string(
     'output_dir', None, 'Directory to write predictions to.', required=True)
+flags.DEFINE_bool(
+    'overwrite', False, 'Whether to overwrite existing results.')
 flags.DEFINE_string(
     'tfds_name',
     'lvis',
@@ -118,6 +120,10 @@ flags.DEFINE_integer(
     'JSON files. The model predictions are zero-indexed. COCO or LVIS use '
     'one-indexed labels, so label_shift should be 1 for these datasets. Set '
     'it to 0 for zero-indexed datasets.'
+)
+flags.DEFINE_float(
+    'confidence_threshold', 0.1,
+    'Threshold for setting a minimum confidence value'
 )
 
 FLAGS = flags.FLAGS
@@ -670,7 +676,7 @@ def plot_image(pixels, image_id, gt_by_image, pred_by_image, labels):
     for ann in gt_by_image[image_id]:
       plot_box(ax, ann, color='g', label=False)
     for ann in anns:
-      if ann['score'] <= threshold:
+      if ann['score'] <= FLAGS.confidence_threshold:
         continue
       plot_box(ax, ann, color='r', labels=labels, score=ann['score'])
   ax.set_title('Predictions')
@@ -743,6 +749,18 @@ def main(argv: Sequence[str]) -> None:
 
   config_name = os.path.splitext(os.path.basename(FLAGS.config))[0]
 
+  output_dir = os.path.join(FLAGS.output_dir, config_name, FLAGS.tfds_name)
+  tf.io.gfile.makedirs(output_dir)
+  existing = tf.io.gfile.glob(os.path.join(output_dir, f'*_{FLAGS.split}.json'))
+  if existing:
+    if FLAGS.overwrite:
+      for path in existing:
+        tf.io.gfile.remove(path)
+    else:
+      print(
+          f'Found existing results and --overwrite=false, exiting: {existing}')
+      return
+
   if tf.io.gfile.exists(FLAGS.annotations_path):
     annotations_path = FLAGS.annotations_path
   else:
@@ -755,24 +773,8 @@ def main(argv: Sequence[str]) -> None:
       split=FLAGS.split,
       label_shift=FLAGS.label_shift)
 
-  output_dir = os.path.join(
-      FLAGS.output_dir, config_name, FLAGS.tfds_name, _timestamp()
-  )
   logging.info('Writing predictions to %s', output_dir)
-  tf.io.gfile.makedirs(output_dir)
   predictions_path = write_predictions(predictions, output_dir, FLAGS.split)
-
-  #logging.info('Running evaluation...')
-  #try:
-  #  results = run_evaluation(annotations_path, predictions_path,
-  #                           FLAGS.data_format)
-  #except IndexError as e:
-  #  logging.exception('IndexError while computing metric.')
-  #  results = {'ERROR': str(e)}
-
-  #with tf.io.gfile.GFile(
-  #    os.path.join(output_dir, f'results_{FLAGS.split}.json'), 'w') as f:
-  #  json.dump(results, f, indent=4)
 
   if FLAGS.num_example_images_to_save:
     logging.info('Saving example images...')
